@@ -1,19 +1,22 @@
+import json
 import os
+import random
 import string
 import subprocess
 import sys
 import threading
 import time
 from enum import Enum
+from json import JSONDecodeError
 
 import gi
 from mpg123 import Mpg123, Out123
 
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
 from gi.repository import Gtk
 from gi.repository.Gtk import License, Widget, ListBox, ListBoxRow
-from gi.repository import Gio
-from gi.repository import GObject
+from gi.repository import Gio, GLib, GObject, Gdk
 
 
 class ItemMusic(GObject.GObject):
@@ -21,29 +24,126 @@ class ItemMusic(GObject.GObject):
     musicPath = GObject.Property(type=str, default="")
     musicIndex = GObject.Property(type=int, default=0)
 
-    def __init__(self, musicName, musicPath='', musicIndex=0):
+    def __init__(self, name, path='', index=0):
         super().__init__()
-        self.props.musicName = musicName
-        self.props.musicPath = musicPath
-        self.props.musicIndex = musicIndex
+        self.props.musicName = name
+        self.props.musicPath = path
+        self.props.musicIndex = index
 
     def __repr__(self):
         return f'music name: {self.musicName}, path: {self.musicPath}, index: {self.musicIndex}'
 
-    def __cmp__(self, other):
-        if self.musicPath == other.musicPath:
-            return 0
-        else:
-            return 1
+    def __eq__(self, other):
+        return True if self.path == other.path else False
 
-    def getMusicName(self):
+    @property
+    def name(self):
         return self.props.musicName
 
-    def getMusicPath(self):
+    @property
+    def path(self):
         return self.props.musicPath
 
-    def getMusicIndex(self):
+    @property
+    def index(self):
         return self.props.musicIndex
+
+
+class PlayMode(Enum):
+    loop = 0
+    random = 1
+    singleLoop = 2
+    sequence = 3
+
+    def next(self):
+        return PlayMode.__new__(PlayMode, (self.value + 1) % 4)
+
+
+class Player:
+    """使用mpg123的python wrapper包封装一个播放器"""
+
+    class PlayState(Enum):
+        playing = 0
+        stop = 1
+        pause = 2
+
+    class MyThread(threading.Thread):
+        def __init__(self, out123, callback, event):
+            threading.Thread.__init__(self)
+            self.mpg123 = None
+            self.out123 = out123
+            self.length = 0
+            self.count = 0
+            self.callback = callback
+            self.event = event
+
+        def update(self, mpg123, length):
+            self.mpg123 = mpg123
+            self.length = length
+            self.count = 0
+
+        def run(self):
+            while True:
+                self.event.wait()
+                print("开始线程")
+                for frame in self.mpg123.iter_frames():
+                    # if _gState != self.PlayerState.playing:
+                    #     break
+                    if not self.event.isSet():
+                        break
+                    self.out123.play(frame)
+                    self.count += 1
+                    # print(f'total: {self.length}, current: {self.count}')
+
+                self.callback(self.count >= self.length)
+                print("结束线程")
+
+    def __init__(self, callback):
+        self.playedFrame = 0
+        self.frameLength = 0
+        self.out123 = Out123()
+        self.state = self.PlayState.stop
+        self.mpg = None
+        self.ThreadPlay = None
+        self.callback = callback  # 当状态变化时调用callback
+
+        self.event = threading.Event()
+        self.ThreadPlay = self.MyThread(self.out123, self.playDone, self.event)
+        self.ThreadPlay.setDaemon(True)
+        self.ThreadPlay.start()
+
+    def play(self, filePath: string):
+
+        self.stop()
+        self.mpg = Mpg123(filePath)
+        self.frameLength = self.mpg.frame_length()
+        self.playedFrame = 0
+        self.ThreadPlay.update(self.mpg, self.frameLength)
+        rate, channels, encoding = self.mpg.get_format()
+        self.out123.start(rate=rate, channels=channels, encoding=encoding)
+        self.playInternal()
+
+    def playInternal(self):
+        if self.mpg is not None:
+            self.state = self.PlayState.playing
+            self.event.set()
+
+    def playDone(self, isNormalDone):
+        print("播放完成")
+        self.stop()
+        self.callback(isNormalDone)
+
+    def pause(self):
+        if self.state == self.PlayState.playing:
+            self.event.clear()
+            self.state = self.PlayState.pause
+        elif self.state == self.PlayState.pause:
+            self.playInternal()
+
+    def stop(self):
+        if self.state != self.PlayState.stop:
+            self.event.clear()
+            self.state = self.PlayState.stop
 
 
 class VM:
@@ -59,12 +159,11 @@ class VM:
 
     def onViewDirsChanged(self, newDirs: list):
         if self.model is not None:
-            newFiles = self.model.fetchMusicFiles(newDirs)
-            self.model.storeSettings()
+            self.model.updateDirs(newDirs)
 
-    def onModelDataChanged(self, newFiles: list):
+    def onModelDataChanged(self, newFiles: list, newMode: PlayMode):
         if self.view is not None:
-            self.view.dataChanged(newFiles)
+            self.view.dataLoaded(newFiles, newMode)
 
     def onViewMusicActivated(self, music: ItemMusic):
         if self.model is not None:
@@ -78,27 +177,21 @@ class VM:
         if self.model is not None:
             self.model.togglePlay()
 
-    def onModelPlayStateChanged(self, playState: bool):
+    def onModelPlayStateChanged(self, playState: Player.PlayState, music: ItemMusic):
         if self.view is not None:
-            self.view.playStateChanged(playState)
+            self.view.playStateChanged(playState, music)
 
     def onViewVol(self, up: bool):
         if self.model is not None:
             self.model.adjustVol(up)
 
-    def whichIsPlaying(self):
-        if self.model is not None:
-            return self.model.musicCurrent
-        else:
-            return None
-
-    def onModelAutoNext(self, music):
-        if self.view is not None:
-            self.view.updateSelection(music)
-
     def onViewPrevNext(self, isDirectionNext):
         if self.model is not None:
             self.model.playPrevNext(isDirectionNext)
+
+    def onViewModeChanged(self, callback):
+        if self.model is not None:
+            self.model.updateMode(callback)
 
 
 class MPythonG123Window(Gtk.Window):
@@ -108,23 +201,29 @@ class MPythonG123Window(Gtk.Window):
         super().__init__(title="MPythonG123")
 
         # VM对象
+        self.floatWindow = False
         self.vm = vm
 
         self.programName = 'MPythonG123 Player'
 
         # liststore和filter
-        self.listBox = None
-        self.ListStoreMusic = None
+        self.listBox = Gtk.ListBox()
+        self.ListStoreMusic = Gio.ListStore.new(ItemMusic)
+
+        # 一个VBOX
+        self.vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
 
         # play button, 需要控制其状态
         self.buttonPlay = None
+        self.buttonMode = None
 
         # headbar
         self.hb = None
 
         # 窗口基础属性
         self.set_border_width(10)
-        self.set_default_size(680, 480)
+        self.set_default_size(640, 480)
+        self.preSize = (640, 480)
 
         # titlebar
         self.customTitlebar()
@@ -151,6 +250,16 @@ class MPythonG123Window(Gtk.Window):
         button = Gtk.Button.new_from_icon_name("folder-open-symbolic", Gtk.IconSize.BUTTON)
         box.add(button)
         button.connect("clicked", self.onClickOpen)
+
+        # 播放模式按钮
+        self.buttonMode = Gtk.Button.new_from_icon_name("go-jump-symbolic", Gtk.IconSize.BUTTON)
+        box.add(self.buttonMode)
+        self.buttonMode.connect("clicked", self.onClickMode)
+
+        # 悬浮模式按钮
+        buttonFloat = Gtk.Button.new_from_icon_name("orientation-landscape-symbolic", Gtk.IconSize.BUTTON)
+        box.add(buttonFloat)
+        buttonFloat.connect("clicked", self.onClickFloat)
 
         # 音量加减
         # button = Gtk.Button.new_with_label('-')
@@ -183,10 +292,6 @@ class MPythonG123Window(Gtk.Window):
         self.buttonPlay.connect('clicked', self.onClickPlayPause)
         box.add(self.buttonPlay)
 
-        # 随机按钮
-        # button = Gtk.Button.new_from_icon_name("go-jump-symbolic", Gtk.IconSize.BUTTON)
-        # box.add(button)
-
         # 歌词按钮
         # button = Gtk.Button.new_from_icon_name("format-justify-fill-symbolic", Gtk.IconSize.BUTTON)
         # box.add(button)
@@ -198,27 +303,19 @@ class MPythonG123Window(Gtk.Window):
         self.set_titlebar(self.hb)
 
     def mainArea(self):
-        # 一个VBOX
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-
         hbox1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         hbox2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        vbox.pack_start(hbox1, expand=True, fill=True, padding=10)
-        vbox.pack_end(hbox2, False, True, 0)
+        self.vbox.pack_start(hbox1, True, True, 0)
+        self.vbox.pack_end(hbox2, False, True, 0)
 
-        self.listBox = Gtk.ListBox()
         self.listBox.connect('row-activated', self.onRowActived)
         self.listBox.connect('row-selected', self.onRowSelected)
         self.listBox.set_activate_on_single_click(False)
-        self.ListStoreMusic = Gio.ListStore.new(ItemMusic)
         self.listBox.bind_model(model=self.ListStoreMusic, create_widget_func=self.createListRow)
 
         buttonHolder = Gtk.Button.new_from_icon_name("folder-open-symbolic", Gtk.IconSize.LARGE_TOOLBAR)
         buttonHolder.connect('clicked', self.onClickOpen)
         self.listBox.set_placeholder(placeholder=buttonHolder)
-        # for music in self._musicList:
-        #     item = ItemMusic(music)
-        #     self._musicListModel.append(item)
 
         scrollWindow = Gtk.ScrolledWindow()
         scrollWindow.set_vexpand(True)
@@ -227,24 +324,23 @@ class MPythonG123Window(Gtk.Window):
 
         hbox1.pack_start(scrollWindow, True, True, 0)
 
-        self.add(vbox)
+        self.add(self.vbox)
 
     def onRowActived(self, lb: ListBox, lbr: ListBoxRow):
         index = lbr.get_index()
-        print(f"Row {index} activated")
         im = self.ListStoreMusic.get_item(index)
+        print(f"Row {index} activated, music {im}")
         self.vm.onViewMusicActivated(im)
 
     def onRowSelected(self, lb: ListBox, lbr: ListBoxRow):
         if lbr is not None:
             index = lbr.get_index()
-            print(f"Row {index} selected")
             im = self.ListStoreMusic.get_item(index)
+            print(f"Row {index} selected, {im}")
             self.vm.onViewMusicSelected(im)
 
     def createListRow(self, item: ItemMusic):
-        label = Gtk.Label(label=item.getMusicName())
-        return label
+        return Gtk.Label(label=item.name)
 
     def dialogDir(self):
         openD = Gtk.FileChooserDialog(title="请选择歌曲文件目录", parent=self)
@@ -296,20 +392,61 @@ class MPythonG123Window(Gtk.Window):
         print("next")
         self.vm.onViewPrevNext(True)
 
-    def playStateChanged(self, playState: bool):
-        icon_name = 'media-playback-pause-symbolic' if playState == Player.PlayerState.playing else 'media-playback-start-symbolic'
+    def onClickMode(self, widget):
+        self.vm.onViewModeChanged(self.modeChanged)
+
+    def onClickFloat(self, _):
+        if self.floatWindow:
+            self.set_keep_above(False)
+            self.vbox.show()
+            self.set_resizable(True)
+            self.resize(self.preSize[0], self.preSize[1])
+            self.floatWindow = False
+        else:
+            self.preSize = self.get_size()
+            self.set_keep_above(True)
+            self.vbox.hide()
+            rect = self.get_titlebar().get_allocated_size().allocation
+            print(dir(rect))
+            print(f'title_bar: {rect.x, rect.y, rect.width, rect.height}')
+            #self.set_modal(True)
+            self.set_size_request(rect.width, 1)
+            self.resize(rect.width, 1)
+            self.set_resizable(False)
+            self.floatWindow = True
+
+
+    def modeChanged(self, newMode):
+        if newMode == PlayMode.sequence:
+            icon = 'media-playlist-consecutive-symbolic'
+        elif newMode == PlayMode.singleLoop:
+            icon = 'media-playlist-repeat-song-symbolic'
+        elif newMode == PlayMode.loop:
+            icon = 'media-playlist-repeat-symbolic'
+        elif newMode == PlayMode.random:
+            icon = 'media-playlist-shuffle-symbolic'
+
+        icon = Gio.ThemedIcon(name=icon)
+        image = Gtk.Image.new_from_gicon(icon, Gtk.IconSize.BUTTON)
+        self.buttonMode.set_image(image=image)
+
+    def playStateChanged(self, playState: Player.PlayState, music: ItemMusic):
+        if playState == Player.PlayState.playing:
+            icon_name = 'media-playback-pause-symbolic'
+            if music is not None:
+                self.hb.props.title = music.name
+                self.listBox.select_row(self.listBox.get_row_at_index(music.index))
+        elif playState == Player.PlayState.pause:
+            icon_name = 'media-playback-start-symbolic'
+        elif playState == Player.PlayState.stop:
+            icon_name = 'media-playback-start-symbolic'
+            self.hb.props.title = self.programName
+
         icon = Gio.ThemedIcon(name=icon_name)
         image = Gtk.Image.new_from_gicon(icon, Gtk.IconSize.BUTTON)
         self.buttonPlay.set_image(image=image)
 
-        play = self.vm.whichIsPlaying()
-        if play is not None:
-            self.hb.props.title = play.getMusicName()
-
-    def updateSelection(self, music):
-        self.listBox.select_row(self.listBox.get_row_at_index(music.getMusicIndex()))
-
-    def dataChanged(self, files: list):
+    def dataLoaded(self, files: list, mode: PlayMode):
         if self.ListStoreMusic is not None:
             self.ListStoreMusic.remove_all()
             for ff in files:
@@ -318,11 +455,90 @@ class MPythonG123Window(Gtk.Window):
             if self.ListStoreMusic.get_n_items() > 0:
                 self.listBox.select_row(self.listBox.get_row_at_index(0))
 
+        self.modeChanged(mode)
+
     def onClickVolMinus(self, widget):
         self.vm.onViewVol(False)
 
     def onClickVolPlus(self, widget):
         self.vm.onViewVol(True)
+
+
+class MPGSettings:
+    """设置管理"""
+
+    def __init__(self):
+        self.__dirs = 'dirs'
+        self.__mode = 'mode'
+
+        self.defaultDirs = [os.path.expanduser('~/Music')]
+        self.defaultMode = PlayMode.sequence
+
+        # 配置文件路径
+        self.__settingFile = os.path.join(GLib.get_user_config_dir(), 'MPythonG123', 'mpg_config.json')
+        self.__settings = self.readSettings()
+
+    def __str__(self):
+        return json.dumps(self.__settings)
+
+    @property
+    def keyDirs(self):
+        return self.__dirs
+
+    @property
+    def keyMode(self):
+        return self.__mode
+
+    def storeSettings(self):
+        try:
+            fp = open(self.__settingFile, 'w+')
+            fp.write(json.dumps(self.__settings))
+        except FileNotFoundError:
+            os.mkdir(os.path.dirname(self.__settingFile))  # 创建目录
+            with open(self.__settingFile, 'w+') as newfp:
+                newfp.write(json.dumps(self.__settings))
+
+    def readSettings(self):
+        try:
+            settings = open(self.__settingFile, 'r').read()
+            print(f'settings {settings}')
+            return json.loads(settings)
+        except (FileNotFoundError, JSONDecodeError) as error:
+            print(f'read settings from {self.__settingFile} failed, error: {error}')
+            return {}
+
+    def getSetting(self, key: str):
+        try:
+            if key == self.keyMode:
+                return PlayMode(self.__settings[key])
+            else:
+                return self.__settings[key]
+        except (KeyError, TypeError) as error:
+            if key == self.keyMode:
+                return self.defaultMode
+            elif key == self.keyDirs:
+                return self.defaultDirs
+
+    def updateSetting(self, key: str, value):
+        if key == self.keyMode:
+            newValue = value.value
+        else:
+            newValue = value
+
+        try:
+            if self.__settings[key] != newValue:
+                self.__settings[key] = newValue
+                self.storeSettings()
+                return True
+        except (KeyError, TypeError) as error:  # 为空的时候取不到值
+            self.__settings[key] = newValue
+            self.storeSettings()
+            return True
+
+        return False
+
+    def dumpSettings(self):
+        print(self.settings)
 
 
 class Model:
@@ -333,279 +549,162 @@ class Model:
         self.vm = vm
 
         self.player = Player(self.callbackFromPlayer)
+        self.settings = MPGSettings()
 
-        # 配置文件路径
-        self.settingFilePath = os.path.abspath(os.path.expanduser('~/.MPythonG123/dirs.txt'))
-
-        # comand = ['mpg123', '--remote', '--keep-open', '--remote-err']
-        # self.mpg123 = subprocess.Popen(comand, stdin=subprocess.PIPE, universal_newlines=True, bufsize=1)
-        self.isPlaying = False
         self.musicCurrent = None
         self.musicSelected = None
-        self.musicList = None
-        self.musicFileList = None
-        self.musicDirs = None
-        self.volume = 30
-        self.volumeStep = 5
+        self.musicFileList = list()
+        self.randomList = list()
 
-        self.firstRun = True
+    def updateDirs(self, newDirs: list):
+        if self.settings.updateSetting(self.settings.keyDirs, newDirs):
+            self.loadMusicData()
+        else:  # 文件夹配置项变了，不一定里面的内容没变，所以还是需要载入
+            self.loadMusicData()
+
+    def updateMode(self, callback):
+        oldMode = self.settings.getSetting(self.settings.keyMode)
+
+        if oldMode == PlayMode.random:
+            self.randomList.clear()
+
+        newMode = oldMode.next()
+        if newMode == PlayMode.random and self.musicCurrent is not None:
+            self.randomList.append(self.musicCurrent.index)
+
+        self.settings.updateSetting(self.settings.keyMode, newMode)
+        callback(newMode)
 
     def callbackFromPlayer(self, isNormalDone):
         print(f"callback from player: {isNormalDone}")
         if isNormalDone:
-            index = self.musicCurrent.getMusicIndex()
-            size = len(self.musicFileList)
-            nextS = index + 1 if index < size - 1 else 0
-            music = self.musicFileList[nextS]
-            self.play(music)
-            self.vm.onModelAutoNext(music)
+            GLib.idle_add(self.playPrevNext, True)  # call from another thread
 
     def reset(self):
-        if self.isPlaying:
-            self.stop()
         self.musicCurrent = None
         self.musicSelected = None
-        self.musicList = None
-        self.musicDirs = None
+        self.musicFileList.clear()
 
-    def play(self, music: ItemMusic):
+    def play(self, music: ItemMusic, randomAdd=True):
         if music is not None:
-            # cmd = [f'l {music.getMusicPath()}\n']
-            # self.mpg123.stdin.writelines(cmd)
-
-            self.player.play(music.getMusicPath())
-
+            self.player.play(music.path)
             self.musicCurrent = music
-            self.vm.onModelPlayStateChanged(self.player.state)
+            self.vm.onModelPlayStateChanged(self.player.state, self.musicCurrent)
 
-    def playList(self):
-        if self.musicFileList is not None:
-            pass
+            mode = self.settings.getSetting(self.settings.keyMode)
+            if randomAdd and (mode == PlayMode.random):
+                index = music.index
+                if index not in self.randomList:
+                    self.randomList.append(index)
 
     def stop(self):
-        # cmd = ['s\n']
-        # self.mpg123.stdin.writelines(cmd)
         self.player.stop()
-        self.vm.onModelPlayStateChanged(self.player.state)
+        self.vm.onModelPlayStateChanged(self.player.state, self.musicCurrent)
 
     def pause(self):
-        # cmd = ['p\n']
-        # self.mpg123.stdin.writelines(cmd)
-
         self.player.pause()
-        self.vm.onModelPlayStateChanged(self.player.state)
+        self.vm.onModelPlayStateChanged(self.player.state, self.musicCurrent)
 
     def selected(self, music: ItemMusic):
-        if music is not None:
-            self.musicSelected = music
+        self.musicSelected = music
 
     def togglePlay(self):
-        if self.player.state == self.player.PlayerState.playing:  # 正在播放，则暂停
+        if self.player.state == self.player.PlayState.playing:  # 正在播放，则暂停
             self.pause()
         else:  # 没有在播放
-            if self.musicCurrent is not None:  # 正在播放的音乐记录不为空
-                self.play(self.musicCurrent)  # 播放选中的音乐
+            if self.musicSelected is not None:  # 选择的音乐记录不为空
+                self.play(self.musicSelected)  # 播放选中的音乐
             else:  # 无正在播放的记录
-                if self.musicSelected is not None:  # 有选择的音乐
-                    self.play(self.musicSelected)
-
-    def randomPlay(self):
-        pass
+                if self.musicCurrent is not None:  # 有选择的音乐
+                    self.play(self.musicCurrent)
 
     def showLyrics(self, show: bool):
         pass
 
-    def openDirs(self):
-        pass
-
     def playPrevNext(self, isDirectionNext):
         if self.musicCurrent is None:
-            index = self.musicSelected.getMusicIndex()
+            index = 0
         else:
-            index = self.musicCurrent.getMusicIndex()
-        size = len(self.musicFileList)
-        if isDirectionNext:
-            nextS = index + 1 if index < size - 1 else 0
-        else:
-            nextS = index - 1 if index > 0 else size - 1
-        music = self.musicFileList[nextS]
-        self.play(music)
-        self.vm.onModelAutoNext(music)
+            index = self.musicCurrent.index
 
-    def fetchMusicFiles(self, dirs: list):
+        size = len(self.musicFileList)
+
+        mode = self.settings.getSetting(self.settings.keyMode)
+        if mode == PlayMode.loop:
+            if isDirectionNext:
+                nextS = index + 1 if index < size - 1 else 0
+            else:
+                nextS = index - 1 if index > 0 else size - 1
+        elif mode == PlayMode.sequence:
+            if isDirectionNext:
+                nextS = index + 1 if index < size - 1 else - 1
+            else:
+                nextS = index - 1 if index > 0 else - 1
+        elif mode == PlayMode.singleLoop:
+            nextS = index
+        elif mode == PlayMode.random:
+            print(f'random list {self.randomList}')
+            if isDirectionNext:
+                while True:
+                    nextS = random.randint(0, size-1)
+                    if nextS != index:
+                        break
+                self.randomList.append(nextS)
+                print(f'random next {nextS}')
+            else:
+                if len(self.randomList) >= 2:
+                    nextS = self.randomList.pop(-2)
+                else:
+                    return
+
+        if nextS < 0:
+            self.pause()
+        else:
+            music = self.musicFileList[nextS]
+            self.play(music, randomAdd=False)
+        self.vm.onModelPlayStateChanged(self.player.state, self.musicCurrent)
+
+    def loadMusicData(self):
         self.reset()
-        self.musicList = []
-        self.musicFileList = []
-        self.musicDirs = dirs
+
+        # 从设置的目录中获取数据
+        dirs = self.settings.getSetting(self.settings.keyDirs)
         print(dirs)
+
         index = 0
         for dd in dirs:
-            ddresult = []
             try:
                 files = os.listdir(dd)
                 for ff in files:
                     if (not ff.startswith('.')) and ff.endswith('.mp3'):
-                        ddresult.append(ff)
                         name, _ = os.path.splitext(ff)
-                        item = ItemMusic(musicName=name, musicPath=os.path.join(dd, ff), musicIndex=index)
+                        item = ItemMusic(name=name, path=os.path.join(dd, ff), index=index)
                         index += 1
                         self.musicFileList.append(item)
-                self.musicList.append((dd, ddresult))
             except PermissionError as error:
                 print(error)
         print(self.musicFileList)
-        self.vm.onModelDataChanged(self.musicFileList)
-        return self.musicFileList
+
+        # 获取播放模式设置
+        playMode = self.settings.getSetting(self.settings.keyMode)
+
+        self.vm.onModelDataChanged(self.musicFileList, playMode)
 
     def adjustVol(self, up: bool):
-        if up:
-            if self.volume + self.volumeStep > 100:
-                self.volume = 100
-            else:
-                self.volume += self.volumeStep
-        else:
-            if self.volume - self.volumeStep < 0:
-                self.volume = 0
-            else:
-                self.volume -= self.volumeStep
-
-        # cmd = [f'v {self.volume}\n']
-        # self.mpg123.stdin.writelines(cmd)
-
-    def storeSettings(self):
-
-        print(self.settingFilePath)
-        if self.musicDirs is not None:
-            try:
-                fp = open(self.settingFilePath, 'w+')
-            except FileNotFoundError:
-                os.mkdir(os.path.dirname(self.settingFilePath))  # 创建目录
-                fp = open(self.settingFilePath, 'w+')
-            finally:
-                settings = [f'{x}\n' for x in self.musicDirs]
-                fp.writelines(settings)
-                fp.close()
-
-    def readSettings(self):
-        try:
-            fp = open(self.settingFilePath, 'r')
-            lines = fp.readlines()
-            print(f'settings {lines}')
-            if len(lines) > 0:
-                dirs = [x.strip('\n') for x in lines]
-                self.firstRun = False
-                self.fetchMusicFiles(dirs)
-        except FileNotFoundError:
-            self.firstRun = True
-        finally:
-            if fp:
-                fp.close()
-
-
-class Player:
-    """使用mpg123的python wrapper包封装一个播放器"""
-
-    class PlayerState(Enum):
-        playing = 0
-        stop = 1
-        pause = 2
-
-    class MyThread(threading.Thread):
-        def __init__(self, out123, callback, event):
-            threading.Thread.__init__(self)
-            self.mpg123 = None
-            self.out123 = out123
-            self.length = 0
-            self.count = 0
-            self.callback = callback
-            self.event = event
-
-        def update(self, mpg123, length):
-            self.mpg123 = mpg123
-            self.length = length
-            self.count = 0
-
-        def run(self):
-            while True:
-                self.event.wait()
-                print("开始线程")
-                for frame in self.mpg123.iter_frames():
-                    # if _gState != self.PlayerState.playing:
-                    #     break
-                    if not self.event.isSet():
-                        break
-                    self.out123.play(frame)
-                    self.count += 1
-                    # print(f'total: {self.length}, current: {self.count}')
-
-                self.callback(self.count >= self.length)
-                print("结束线程")
-
-    def __init__(self, callback):
-        self.playedFrame = 0
-        self.frameLength = 0
-        self.out123 = Out123()
-        self.state = self.PlayerState.stop
-        self.mpg = None
-        self.ThreadPlay = None
-        self.callback = callback  # 当状态变化时调用callback
-
-        self.event = threading.Event()
-        self.ThreadPlay = self.MyThread(self.out123, self.playDone, self.event)
-        self.ThreadPlay.setDaemon(True)
-        self.ThreadPlay.start()
-
-    def play(self, filePath: string):
-
-        self.stop()
-        self.mpg = Mpg123(filePath)
-        self.frameLength = self.mpg.frame_length()
-        self.playedFrame = 0
-        self.ThreadPlay.update(self.mpg, self.frameLength)
-        rate, channels, encoding = self.mpg.get_format()
-        self.out123.start(rate=rate, channels=channels, encoding=encoding)
-        self.playInternal()
-
-    def playInternal(self):
-        if self.mpg is not None:
-            self.state = self.PlayerState.playing
-            self.event.set()
-
-    def playDone(self, isNormalDone):
-        print("播放完成")
-        self.stop()
-        self.callback(isNormalDone)
-
-    def pause(self):
-        if self.state == self.PlayerState.playing:
-            self.event.clear()
-            self.state = self.PlayerState.pause
-        elif self.state == self.PlayerState.pause:
-            self.playInternal()
-
-    def stop(self):
-        if self.state != self.PlayerState.stop:
-            self.event.clear()
-            self.state = self.PlayerState.stop
+        pass
 
 
 def main(args: list):
     vm = VM()
     m = Model(vm)
     v = MPythonG123Window(vm)
-
     vm.setVandM(v, m)
 
-    def appQuit(win: MPythonG123Window):
-        print(win)
-        # if m.mpg123 is not None:
-        #     m.mpg123.terminate()
-
-        Gtk.main_quit()
-
-    v.connect("destroy", appQuit)
+    v.connect("destroy", Gtk.main_quit)
     v.show_all()
-    m.readSettings()
+
+    m.loadMusicData()
+
     Gtk.main()
 
 
